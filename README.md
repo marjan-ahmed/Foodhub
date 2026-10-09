@@ -88,16 +88,44 @@ the chat update. Toggle **owner mode** and type `zinger finished`.
 | `WA_TOKEN` | live WhatsApp | Meta dashboard → permanent via System Users |
 | `WA_PHONE_ID` | live WhatsApp | phone_number_id from the dashboard |
 | `WA_VERIFY_TOKEN` | live WhatsApp | you invent it; must match dashboard |
+| `WA_APP_SECRET` | live WhatsApp | Meta App secret; verifies webhook signatures (required live) |
+| `DEMO_MODE` | safety | `1` (default) enables /demo + /api/sim; set `0` in production |
+| `MAX_QTY` | safety | per-line quantity cap before human review (default 20) |
 | `OWNER_PHONE` | fallback | only if config has no `owner_phone` |
-| `LLM_API_KEY` | optional | fallback for messages the parser can't handle; free tier at aistudio.google.com |
+| `LLM_API_KEY` | optional | fallback for messages the parser can't handle |
+| `LLM_BASE_URL` | optional | OpenAI-compatible endpoint. For a free Gemini key (aistudio.google.com): `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| `LLM_MODEL` | optional | e.g. `gemini-2.5-flash` for the Gemini endpoint, `gpt-4o-mini` for OpenAI |
 
-## Costs to know (Pakistan, verify before quoting a client)
+Owner commands over WhatsApp: `MENU` · `'<item> finished'` · `'<item> available'`
+· `TODAY` · `'bot off'` / `'bot on'` (kill switch — customers get a "we're
+closed" reply while off).
 
-Meta charges ~$0.015/message for Pakistan. Replies inside the 24-hour
-customer-service window are free up to 1,000/month per number — the normal
-order flow lives inside that window. Business-initiated template messages
-outside it are billed. Pricing model: PKR 35k setup + PKR 20k/month retainer,
-Meta fees passed through at cost.
+## Costs to know (Pakistan — verified Oct 2026)
+
+Meta's Pakistan rate card, effective **1 October 2026**:
+
+| Category | USD / delivered message | ≈ PKR |
+|---|---|---|
+| Marketing | $0.0473 | ~13.1 |
+| Utility / Authentication / **Service** | **$0.0150** | **~4.15** |
+
+Since 1 Oct 2026, **service replies inside the 24-hour customer window are
+billed** (they were free before). Each business number gets the **first 1,000
+service messages/month free**; beyond that they're billed at the utility rate.
+Utility templates sent inside the window are billed from the first message.
+Sources: Meta's published rate cards via
+[engagelab.com](https://www.engagelab.com/blog/whatsapp-business-api-pricing),
+[tekkpak.com](https://tekkpak.com/chatbot-companies-in-pakistan/),
+[wab2c.com](https://wab2c.com/resources/blog/whatsapp-business-api-pricing-pakistan-2026).
+Re-check [Meta's pricing page](https://developers.facebook.com/docs/whatsapp/pricing)
+before quoting a client — Meta changes these rules.
+
+Worked example: 50 orders/day × ~5 bot messages × 30 days = ~7,500 messages.
+Minus 1,000 free = ~6,500 × $0.015 ≈ **$97 ≈ PKR 27,000/month** in Meta fees.
+That's why the model is **PKR 35k setup + PKR 20k/month retainer, Meta fees
+passed through at cost** — a flat monthly fee would lose money on Meta's bill
+alone at real volumes. Sales tactic: offer the first two weeks as a free pilot
+(you absorb the small pilot Meta bill) so the owner sees it work before paying.
 
 ## Repo layout
 
@@ -111,6 +139,15 @@ requirements.txt
 
 ## Roadmap (not built yet)
 
-Postgres for sessions/tickets (currently in-memory), multi-tenant single
-process (currently one process per restaurant), production webhook signature
-verification, per-restaurant Meta cost tracking.
+Postgres for sessions/tickets/wamid-log (currently in-memory), multi-tenant
+single process (currently one process per restaurant), per-restaurant Meta cost
+tracking. Webhook signature verification, wamid dedup, quantity cap, demo-mode
+gating, and the kill switch are already in.
+
+## Security notes for a live number
+
+- Set `WA_APP_SECRET` and `DEMO_MODE=0` before connecting a real number.
+- The kill switch (`'bot off'` from the owner number) is in-memory; a restart
+  re-enables the bot. Move it into the restaurant config/DB for production.
+- When `LLM_API_KEY` is set, raw customer text is sent to the configured LLM
+  endpoint. Decide on customer disclosure before enabling it for a client.
