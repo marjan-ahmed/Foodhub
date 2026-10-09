@@ -30,7 +30,9 @@ ONBOARDING A NEW RESTAURANT (the 48-hour playbook)
   3. Get a spare SIM from the owner; register it as the bot's number
      in the Meta dashboard (Step 2: Production setup, OTP via call/SMS).
   4. Deploy: RESTAURANT_CONFIG=... WA_TOKEN=... WA_PHONE_ID=...
-     WA_VERIFY_TOKEN=... python app.py   (webhook -> https://<url>/webhook)
+     WA_VERIFY_TOKEN=... WA_APP_SECRET=... DEMO_MODE=0 python app.py
+     (webhook -> https://<url>/webhook; WA_APP_SECRET enables signature
+     verification, DEMO_MODE=0 disables the demo endpoints for production)
   5. Kitchen tablet open at /kitchen. Test an order together with the owner.
   6. Go live: bot number + QR code on menu, flyers, Google profile.
 
@@ -50,7 +52,10 @@ import sys
 import json
 import time
 import html
+import hmac
+import hashlib
 import difflib
+from collections import deque
 from datetime import datetime
 
 from fastapi import FastAPI, Request
@@ -67,7 +72,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "demo123")
 WA_TOKEN     = os.getenv("WA_TOKEN", "")        # Meta Cloud API bearer token
 WA_PHONE_ID  = os.getenv("WA_PHONE_ID", "")     # phone_number_id from dashboard
+WA_APP_SECRET = os.getenv("WA_APP_SECRET", "")  # Meta app secret (webhook signatures)
 OWNER_PHONE  = os.getenv("OWNER_PHONE", "")     # fallback if not in config
+DEMO_MODE    = os.getenv("DEMO_MODE", "1") == "1"  # /demo + /api/sim enabled
+MAX_QTY      = int(os.getenv("MAX_QTY", "20"))  # per-line quantity cap
 LLM_API_KEY  = os.getenv("LLM_API_KEY", "")     # optional enhancement
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL    = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -185,9 +193,13 @@ T = {
         "available_set": "{name} is back on the menu!",
         "not_on_menu": "Can't find '{word}' on the menu.",
         "today": "Today: {n} orders, Rs {rev} revenue.",
-        "owner_menu_hint": "Owner mode. Commands: MENU | '<item> finished' | '<item> available' | TODAY",
+        "owner_menu_hint": "Owner mode. Commands: MENU | '<item> finished' | '<item> available' | TODAY | 'bot off' | 'bot on'",
         "ticket_preparing": "Good news — order #{oid} is being prepared!",
         "ticket_ready": "Order #{oid} is on its way! The rider has left.",
+        "big_order": "That's a large order — let me get the restaurant to confirm it personally, one moment.",
+        "bot_disabled": "Sorry — we're not taking online orders right now. Please call the restaurant directly.",
+        "bot_off": "Bot disabled — customers get the 'closed' reply until you say 'bot on'.",
+        "bot_on": "Bot enabled — taking orders again.",
     },
     "ur": {
         "greeting": "Assalam-o-Alaikum! {brand} mein khush aamdeed. Order is tarah bhejein: '2 zinger, 1 coke'. Mukammal menu ke liye MENU likhein.",
@@ -209,11 +221,23 @@ T = {
         "available_set": "{name} wapas menu mein hai!",
         "not_on_menu": "'{word}' menu mein nahi mila.",
         "today": "Aaj: {n} orders, Rs {rev} sale.",
-        "owner_menu_hint": "Owner mode. Commands: MENU | '<item> finished' | '<item> available' | TODAY",
+        "owner_menu_hint": "Owner mode. Commands: MENU | '<item> finished' | '<item> available' | TODAY | 'bot off' | 'bot on'",
         "ticket_preparing": "Khushkhabri — order #{oid} tayyar ho raha hai!",
         "ticket_ready": "Order #{oid} nikal gaya! Rider rawana ho chuka hai.",
+        "big_order": "Ye bara order hai — restaurant se confirm karwa kar batata hun, ek minute.",
+        "bot_disabled": "Maazrat — hum abhi online order nahi le rahe. Barah-e-karam restaurant ko call karein.",
+        "bot_off": "Bot band kar diya — 'bot on' kehne tak customers ko 'closed' reply milega.",
+        "bot_on": "Bot chalu kar diya — orders le rahe hain.",
     },
 }
+
+
+# Currency comes from the restaurant config (default Rs).
+CUR = (CFG.get("currency") or "Rs").strip() or "Rs"
+if CUR != "Rs":
+    for _lang in T:
+        for _k in T[_lang]:
+            T[_lang][_k] = T[_lang][_k].replace("Rs", CUR)
 
 
 def tr(lang: str, key: str, **kw) -> str:
@@ -381,8 +405,13 @@ def llm_parse(text: str, lang: str):
 
 # --------------------------- Core handler --------------------------
 def is_owner(phone: str) -> bool:
+    # "__owner__" is the demo-simulator sentinel. It can only arrive via
+    # /api/sim, which is gated behind DEMO_MODE, and the webhook refuses it
+    # outright — so it can never impersonate the owner in production.
+    if phone == "__owner__":
+        return True
     owner = (CFG.get("owner_phone") or OWNER_PHONE or "").strip()
-    return bool(owner) and phone in (owner, "__owner__")
+    return bool(owner) and phone == owner
 
 
 def owner_command(phone: str, text: str, lang: str):
@@ -394,6 +423,12 @@ def owner_command(phone: str, text: str, lang: str):
         todays = [o for o in tickets if o["date"] == today]
         rev = sum(o["total"] for o in todays)
         return [T[lang]["today"].format(n=len(todays), rev=f"{rev:,}")]
+    if t in ("bot off", "bot stop", "stop bot", "bot band", "band karo"):
+        CFG["bot_enabled"] = False          # in-memory; resets on restart
+        return [T[lang]["bot_off"]]
+    if t in ("bot on", "bot start", "start bot", "bot chalu", "chalu karo"):
+        CFG["bot_enabled"] = True
+        return [T[lang]["bot_on"]]
     mfin = re.match(r"(.+?)\s+(finished|khatam)\s*$", t)
     if mfin:
         return [toggle_item(mfin.group(1), False, lang)]
@@ -455,6 +490,14 @@ def finalize_order(phone: str, lang: str):
     return [tr(lang, "confirmed", oid=oid, eta=CFG.get("eta", "35-45"))]
 
 
+def oversized_reply(items, phone: str, text: str, lang: str):
+    """Route absurd quantities to a human instead of accepting them."""
+    if any(q > MAX_QTY for _, q in items):
+        notify_staff(f"BIG ORDER from {phone} (cap {MAX_QTY}/line): {text}")
+        return T[lang]["big_order"]
+    return None
+
+
 def handle_message(phone: str, text: str):
     """Main entry point. Returns a list of reply strings."""
     lang = detect_lang(text)
@@ -463,13 +506,17 @@ def handle_message(phone: str, text: str):
     t = norm(text)
     replies = []
 
-    # ---- owner commands ----
+    # ---- owner commands (work even when the bot is disabled) ----
     if is_owner(phone):
         oc = owner_command(phone, text, lang)
         if oc:
             return oc
         if t in ("help", "commands"):
             return [T[lang]["owner_menu_hint"]]
+
+    # ---- kill switch ----
+    if not CFG.get("bot_enabled", True):
+        return [T[lang]["bot_disabled"]]
 
     # ---- universal: cancel ----
     if t in NO:
@@ -487,6 +534,9 @@ def handle_message(phone: str, text: str):
             return [T[lang]["ask_address"]]
         items, clar, _unav, left = find_items(t)
         if items or clar:
+            big = oversized_reply(items, phone, text, lang)
+            if big:
+                return [big]
             sess["pending"] = items
             if left and not sess.get("address"):
                 sess["address"] = left
@@ -542,6 +592,9 @@ def handle_message(phone: str, text: str):
             items, clar, unavailable, leftover = llm
     if clar and not items:
         return start_clarify(sess, clar[0], lang)
+    big = oversized_reply(items, phone, text, lang)
+    if big:
+        return [big]
     if items:
         sess["pending"] = items
         if leftover and not sess.get("address"):
@@ -614,6 +667,40 @@ def set_ticket_status(oid: str, status: str):
             return tk
     return None
 
+# --------------------------- Security --------------------------------
+# Meta retries webhook deliveries; without dedup a retried message would
+# create a duplicate ticket. Bounded in-memory for the MVP — move to a
+# UNIQUE column in Postgres for production.
+_seen_ids = set()
+_seen_order = deque(maxlen=5000)
+
+
+def wamid_seen(wid: str) -> bool:
+    """True if this Meta message id was already processed."""
+    if not wid:
+        return False
+    if wid in _seen_ids:
+        return True
+    if len(_seen_order) == _seen_order.maxlen:
+        _seen_ids.discard(_seen_order[0])   # evict oldest before auto-drop
+    _seen_order.append(wid)
+    _seen_ids.add(wid)
+    return False
+
+
+def verify_signature(raw: bytes, header: str) -> bool:
+    """Check Meta's X-Hub-Signature-256 against the raw request body.
+    Fail-open (with a loud startup warning) when WA_APP_SECRET is unset,
+    so local testing isn't blocked. Always set it for a live number."""
+    if not WA_APP_SECRET:
+        return True
+    if not header.startswith("sha256="):
+        return False
+    mac = hmac.new(WA_APP_SECRET.encode("utf-8"), raw,
+                   hashlib.sha256).hexdigest()
+    return hmac.compare_digest("sha256=" + mac, header)
+
+
 # --------------------------- FastAPI app ---------------------------
 app = FastAPI(title=f"{BRAND} Order Bot")
 
@@ -628,8 +715,11 @@ def webhook_verify(hub_mode: str = "", hub_verify_token: str = "",
 
 @app.post("/webhook")
 async def webhook_receive(req: Request):
+    raw = await req.body()
+    if not verify_signature(raw, req.headers.get("x-hub-signature-256", "")):
+        return JSONResponse({"ok": False}, status_code=403)
     try:
-        body = await req.json()
+        body = json.loads(raw)
     except Exception:
         return JSONResponse({"ok": False})
     for entry in body.get("entry", []):
@@ -638,7 +728,11 @@ async def webhook_receive(req: Request):
             for msg in val.get("messages", []):
                 if msg.get("type") != "text":
                     continue
+                if wamid_seen(msg.get("id") or ""):
+                    continue                      # Meta retry — skip
                 sender = msg.get("from", "")
+                if sender == "__owner__":
+                    continue                      # demo sentinel never via webhook
                 text = msg.get("text", {}).get("body", "")
                 for reply in handle_message(sender, text):
                     send_whatsapp(sender, reply)
@@ -647,7 +741,10 @@ async def webhook_receive(req: Request):
 
 @app.post("/api/sim")
 async def api_sim(req: Request):
-    """Demo-mode chat: powers the /demo phone simulator."""
+    """Demo-mode chat: powers the /demo phone simulator.
+    Disabled unless DEMO_MODE=1 — never expose owner impersonation live."""
+    if not DEMO_MODE:
+        return JSONResponse({"ok": False}, status_code=404)
     body = await req.json()
     phone = str(body.get("phone", "demo-customer")).strip() or "demo-customer"
     if not phone.startswith("demo") and phone != "__owner__":
@@ -808,6 +905,8 @@ def page_kitchen():
 
 @app.get("/demo", response_class=HTMLResponse)
 def page_demo():
+    if not DEMO_MODE:
+        return HTMLResponse("Not found", status_code=404)
     return brand_page(DEMO_HTML)
 
 
@@ -939,4 +1038,10 @@ if __name__ == "__main__":
     print(f"  config      : {CONFIG_PATH}")
     print(f"  demo chat   : http://localhost:{PORT}/demo")
     print(f"  kitchen     : http://localhost:{PORT}/kitchen")
+    if not WA_APP_SECRET:
+        print("  WARNING: WA_APP_SECRET not set — webhook signatures NOT "
+              "verified. Set it before connecting a live number.")
+    if DEMO_MODE:
+        print("  demo mode ON (/demo + /api/sim enabled). "
+              "Set DEMO_MODE=0 for production.")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
