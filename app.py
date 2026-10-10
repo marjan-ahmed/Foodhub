@@ -484,9 +484,12 @@ def confirm_text(sess: dict, lang: str) -> str:
     return T[lang]["bill_no_addr"].format(lines=lines, total=f"{total:,}")
 
 
-def finalize_order(phone: str, lang: str):
+def finalize_order(skey: str, lang: str, scope: str = "", sender: str = ""):
+    """Create the ticket from the session cart. skey is the scoped session
+    key; sender is the customer's raw phone for display/replies."""
     global order_seq
-    sess = get_session(phone)
+    sess = get_session(skey)
+    phone = sender or skey
     order_seq += 1
     oid = f"A-{order_seq}"
     items = sess["pending"]
@@ -494,7 +497,7 @@ def finalize_order(phone: str, lang: str):
     addr = sess.get("address") or "—"
     now = datetime.now()
     ticket = {
-        "id": oid, "phone": phone,
+        "id": oid, "phone": phone, "via": scope or WA_PHONE_ID,
         "items": [{"name": m["name"], "qty": q, "price": m["price"]}
                   for m, q in items],
         "total": total, "address": addr, "status": "new",
@@ -519,10 +522,13 @@ def oversized_reply(items, phone: str, text: str, lang: str):
     return None
 
 
-def handle_message(phone: str, text: str):
-    """Main entry point. Returns a list of reply strings."""
+def handle_message(phone: str, text: str, scope: str = ""):
+    """Main entry point. Returns a list of reply strings.
+    scope = receiving number's phone ID; sessions are namespaced per scope
+    so the same customer on two different numbers doesn't share a cart."""
+    skey = f"{scope}:{phone}" if scope else phone
     lang = detect_lang(text)
-    sess = get_session(phone)
+    sess = get_session(skey)
     sess["lang"] = lang
     t = norm(text)
     replies = []
@@ -550,7 +556,7 @@ def handle_message(phone: str, text: str):
     if sess["state"] == "confirm":
         if t in YES:
             if sess.get("address"):
-                return finalize_order(phone, lang)
+                return finalize_order(skey, lang, scope, phone)
             sess["state"] = "address"
             return [T[lang]["ask_address"]]
         items, clar, _unav, left = find_items(t)
@@ -567,7 +573,7 @@ def handle_message(phone: str, text: str):
             return [confirm_text(sess, lang)]
         if len(t) > 6:                       # probably an address
             sess["address"] = text.strip()
-            return finalize_order(phone, lang)
+            return finalize_order(skey, lang, scope, phone)
         return [confirm_text(sess, lang)]
 
     # ---- state: awaiting clarification answer ----
@@ -592,7 +598,7 @@ def handle_message(phone: str, text: str):
     # ---- state: awaiting address ----
     if sess["state"] == "address":
         sess["address"] = text.strip()
-        return finalize_order(phone, lang)
+        return finalize_order(skey, lang, scope, phone)
 
     # ---- idle: greetings / menu ----
     if t in GREET:
@@ -658,12 +664,14 @@ def notify_staff(text: str):
         outbox.append({"to": "STAFF", "text": text, "at": time.time()})
 
 
-def send_whatsapp(to: str, text: str) -> bool:
-    """Send via Meta Cloud API when configured; otherwise log to outbox."""
-    if WA_TOKEN and WA_PHONE_ID and http:
+def send_whatsapp(to: str, text: str, phone_id: str = None) -> bool:
+    """Send via Meta Cloud API when configured; otherwise log to outbox.
+    phone_id = which business number sends (defaults to WA_PHONE_ID)."""
+    pid = phone_id or WA_PHONE_ID
+    if WA_TOKEN and pid and http:
         try:
             r = http.post(
-                f"https://graph.facebook.com/v21.0/{WA_PHONE_ID}/messages",
+                f"https://graph.facebook.com/v21.0/{pid}/messages",
                 headers={"Authorization": f"Bearer {WA_TOKEN}",
                          "Content-Type": "application/json"},
                 json={"messaging_product": "whatsapp", "to": to,
@@ -696,7 +704,8 @@ def set_ticket_status(oid: str, status: str):
             key = {"preparing": "ticket_preparing",
                    "ready": "ticket_ready"}.get(status)
             if key and not tk["phone"].startswith("demo"):
-                send_whatsapp(tk["phone"], T[lang][key].format(oid=oid))
+                send_whatsapp(tk["phone"], T[lang][key].format(oid=oid),
+                              phone_id=tk.get("via"))
             return tk
     return None
 
@@ -758,6 +767,7 @@ async def webhook_receive(req: Request):
     for entry in body.get("entry", []):
         for change in entry.get("changes", []):
             val = change.get("value", {})
+            recv_id = val.get("metadata", {}).get("phone_number_id") or WA_PHONE_ID
             for msg in val.get("messages", []):
                 if msg.get("type") != "text":
                     continue
@@ -767,8 +777,8 @@ async def webhook_receive(req: Request):
                 if sender == "__owner__":
                     continue                      # demo sentinel never via webhook
                 text = msg.get("text", {}).get("body", "")
-                for reply in handle_message(sender, text):
-                    send_whatsapp(sender, reply)
+                for reply in handle_message(sender, text, scope=recv_id):
+                    send_whatsapp(sender, reply, phone_id=recv_id)
     return JSONResponse({"ok": True})
 
 
