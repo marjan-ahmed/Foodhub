@@ -24,7 +24,9 @@ the chat update. Toggle **owner mode** and type `zinger finished`.
 
 ## Onboarding a new restaurant (the 48-hour playbook)
 
-1. **Collect the PKR 35k setup fee upfront.**
+1. **Collect the PKR 35k setup fee upfront.** (For the very first pilot
+   client, consider waiving it until the 2-week pilot converts — the prize
+   there is proof and a testimonial, not the fee.)
 2. **Scaffold the config** — ~10 minutes, guided prompts:
    ```bash
    python app.py --new
@@ -34,17 +36,20 @@ the chat update. Toggle **owner mode** and type `zinger finished`.
    ```bash
    python app.py --check restaurants/<slug>.json
    ```
-3. **Get a spare SIM from the owner.** Register it as the bot's WhatsApp number
-   in the Meta dashboard (Step 2: Production setup, OTP via call/SMS). The
-   number becomes API-only — it can't stay in the WhatsApp app, so never use
-   the owner's daily number.
-4. **Deploy their instance:**
+3. **Get a spare SIM from the owner.** The owner buys a new SIM (~Rs 150–350,
+   biometric verification at any franchise — you can't do this part for
+   them). It must never have been on WhatsApp before. Register it as the
+   bot's number in the Meta dashboard (Step 2: Production setup, OTP via
+   call/SMS — the owner just reads you the code). The number becomes
+   API-only — it can't stay in the WhatsApp app, so **never use the owner's
+   daily number**.
+4. **Deploy their instance.** Fill in `.env` (copy from `.env.example`):
    ```bash
-   RESTAURANT_CONFIG=restaurants/<slug>.json \
-   WA_TOKEN=... WA_PHONE_ID=... WA_VERIFY_TOKEN=... \
    python app.py
    ```
-   Point the Meta webhook at `https://<your-url>/webhook`.
+   Point the Meta webhook at `https://<your-url>/webhook` — the `/webhook`
+   path is required; the bare domain will fail verification. Subscribe to
+   the `messages` field.
 5. **Kitchen screen** — a cheap tablet at the counter on `/kitchen`.
 6. **Test together** — order from your phone while the owner watches the
    ticket appear. Chef taps the buttons, you get the "ready" message.
@@ -82,11 +87,16 @@ the chat update. Toggle **owner mode** and type `zinger finished`.
 
 ## Environment variables
 
+Copy `.env.example` to `.env` and fill it in — **the app loads `.env`
+automatically on startup** (a real environment variable always overrides the
+file, so per-terminal `set`/`export` still works when you need it). Never
+commit the real `.env` (it's gitignored).
+
 | Var | Needed for | Notes |
 |---|---|---|
 | `RESTAURANT_CONFIG` | always | path to the restaurant JSON (default: demo) |
 | `WA_TOKEN` | live WhatsApp | Meta dashboard → permanent via System Users |
-| `WA_PHONE_ID` | live WhatsApp | phone_number_id from the dashboard |
+| `WA_PHONE_ID` | live WhatsApp | phone_number_id from the dashboard. This is the *default* sending number; when several numbers share one app instance, each reply goes out via whichever number received the message (see "Multi-number behavior") |
 | `WA_VERIFY_TOKEN` | live WhatsApp | you invent it; must match dashboard |
 | `WA_APP_SECRET` | live WhatsApp | Meta App secret; verifies webhook signatures (required live) |
 | `DEMO_MODE` | safety | `1` (default) enables /demo + /api/sim; set `0` in production |
@@ -99,6 +109,58 @@ the chat update. Toggle **owner mode** and type `zinger finished`.
 Owner commands over WhatsApp: `MENU` · `'<item> finished'` · `'<item> available'`
 · `TODAY` · `'bot off'` / `'bot on'` (kill switch — customers get a "we're
 closed" reply while off).
+
+## Live demo over real WhatsApp (ngrok)
+
+For a restaurant visit, a bot answering on the owner's own phone beats any
+screen demo. On your laptop:
+
+```bash
+python app.py            # with live credentials in .env, DEMO_MODE=0
+ngrok http 8000          # second terminal
+```
+
+Set the Meta webhook callback to `https://<ngrok-url>/webhook`, verify, and
+subscribe to `messages`. Then have the owner message the test/bot number from
+their phone.
+
+**ngrok free rotates the URL on every restart** — each restart means updating
+the dashboard callback and re-verifying. For a demo: update once, then don't
+touch ngrok, don't close the laptop, and disable sleep. For a real pilot, use
+a stable host (VPS / Railway / Render) or paid ngrok — the rotating URL is
+too fragile for production.
+
+## Multi-number behavior
+
+One app instance can serve several WhatsApp numbers (all subscribed to the
+same webhook). Each reply goes out via **whichever number received the
+message** (read from the webhook's `phone_number_id`; `WA_PHONE_ID` is only
+the fallback), and customer sessions are **scoped per number** — the same
+person ordering on two numbers gets two separate carts. Kitchen tickets
+record which number took the order (`via`).
+
+## Troubleshooting
+
+- **Webhook verifies (200) but message events never arrive.** The `messages`
+  subscription is stale — dashboard → Webhooks → unsubscribe `messages`,
+  subscribe again, then hit **Test** and watch the ngrok inspector
+  (`http://127.0.0.1:4040`) for the POST.
+- **Bot receives but the phone gets no reply.** Check the terminal: `[sent
+  -> <number>: <wamid>]` means Meta accepted the reply; `[send failed
+  <code>: ...]` names the exact cause (dead token, wrong phone ID…);
+  `[demo] Would send via WhatsApp …` means the running app has no
+  `WA_TOKEN` (usually: code updated but `git pull` + restart forgotten).
+  Unsent replies pile up visibly at `/api/outbox`.
+- **Callback URL rejected at verification.** It must end in `/webhook`;
+  the app must be running with the matching `WA_VERIFY_TOKEN` when you
+  click Verify.
+- **Meta 2FA SMS never arrives (common in Pakistan).** Use the voice-call
+  option under "Need another way to authenticate?", and add an
+  authenticator app as the 2FA method (Facebook → Settings → Accounts
+  Center → Password and security) so it never blocks you again.
+- **Dashboard shows "This phone number is already registered".** Migrating a
+  number into the API permanently disconnects it from the WhatsApp app.
+  Never migrate anyone's daily number — always a fresh spare SIM.
 
 ## Costs to know (Pakistan — verified Oct 2026)
 
@@ -141,8 +203,9 @@ requirements.txt
 
 Postgres for sessions/tickets/wamid-log (currently in-memory), multi-tenant
 single process (currently one process per restaurant), per-restaurant Meta cost
-tracking. Webhook signature verification, wamid dedup, quantity cap, demo-mode
-gating, and the kill switch are already in.
+tracking. Already in: webhook signature verification, wamid dedup, quantity
+cap, demo-mode gating, kill switch, `.env` auto-loading, send-result logging,
+and multi-number reply routing with per-number sessions.
 
 ## Security notes for a live number
 
