@@ -68,6 +68,27 @@ except ImportError:                      # demo/simulator works without it
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _load_dotenv(path):
+    """Load KEY=VALUE lines from a .env file (if present) into os.environ.
+    Real environment variables always win over the file."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 # ----------------------------- Config ------------------------------
 VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "demo123")
 WA_TOKEN     = os.getenv("WA_TOKEN", "")        # Meta Cloud API bearer token
