@@ -669,10 +669,22 @@ def send_whatsapp(to: str, text: str) -> bool:
                 json={"messaging_product": "whatsapp", "to": to,
                       "type": "text", "text": {"body": text}},
                 timeout=10)
-            return r.status_code < 300
-        except Exception:
+            ok = r.status_code < 300
+            if ok:
+                try:
+                    mid = r.json().get("messages", [{}])[0].get("id", "?")
+                except Exception:
+                    mid = "?"
+                print(f"[sent -> {to}: {mid}]", flush=True)
+            else:
+                print(f"[send failed {r.status_code}: {r.text[:200]}]",
+                      flush=True)
+            return ok
+        except Exception as e:
+            print(f"[send error {e}]", flush=True)
             return False
     outbox.append({"to": to, "text": text, "at": time.time()})
+    print(f"[demo] Would send via WhatsApp to {to}: {text[:60]}", flush=True)
     return True
 
 
